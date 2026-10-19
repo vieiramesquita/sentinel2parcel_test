@@ -402,6 +402,73 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     // Motor de Inferência Espacial Client-Side (Turf.js)
     // =========================================================================
+
+    /**
+     * Helper seguro para união de polígonos compatível com Turf v6 e v7
+     */
+    function safeUnion(polyA, polyB) {
+        if (!polyA) return polyB;
+        if (!polyB) return polyA;
+        try {
+            return turf.union(turf.featureCollection([polyA, polyB]));
+        } catch (e1) {
+            try {
+                return turf.union(polyA, polyB);
+            } catch (e2) {
+                console.warn("safeUnion failed:", e2);
+                return polyA;
+            }
+        }
+    }
+
+    /**
+     * Helper seguro para diferença de polígonos compatível com Turf v6 e v7
+     */
+    function safeDifference(polyA, polyB) {
+        if (!polyA || !polyB) return polyA;
+        try {
+            return turf.difference(turf.featureCollection([polyA, polyB]));
+        } catch (e1) {
+            try {
+                return turf.difference(polyA, polyB);
+            } catch (e2) {
+                console.warn("safeDifference failed:", e2);
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Cria polígono de recorte por bissetriz perpendicular entre P (positivo) e N (negativo)
+     * Tudo o que estiver do lado de N a partir do ponto médio é recortado.
+     */
+    function createBisectorExclusion(posCoords, negCoords, polyBBox) {
+        const dx = negCoords[0] - posCoords[0];
+        const dy = negCoords[1] - posCoords[1];
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len === 0) return null;
+
+        const ux = dx / len;
+        const uy = dy / len;
+        const px = -uy;
+        const py = ux;
+
+        const mx = (posCoords[0] + negCoords[0]) / 2;
+        const my = (posCoords[1] + negCoords[1]) / 2;
+
+        const span = Math.max(
+            Math.abs(polyBBox[2] - polyBBox[0]),
+            Math.abs(polyBBox[3] - polyBBox[1])
+        ) * 4 + 0.05;
+
+        const pA = [mx - px * span, my - py * span];
+        const pB = [mx + px * span, my + py * span];
+        const pC = [mx + px * span + ux * span, my + py * span + uy * span];
+        const pD = [mx - px * span + ux * span, my - py * span + uy * span];
+
+        return turf.polygon([[pA, pB, pC, pD, pA]]);
+    }
+
     function refreshCandidatePrediction() {
         const posPoints = state.candidatePoints.filter(p => p.label === 1);
         const negPoints = state.candidatePoints.filter(p => p.label === 0);
@@ -486,33 +553,103 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
+        // 2. Exclusão de piquetes inteiros pelos pontos negativos (Disjoint Parcel Exclusion)
+        // Se um piquete foi selecionado mas contém um ponto negativo e nenhum positivo, exclui imediatamente
+        if (negPoints.length > 0) {
+            matchedPolygons = matchedPolygons.filter(poly => {
+                const hasPos = posPoints.some(pp => turf.booleanPointInPolygon(turf.point([pp.lon, pp.lat]), poly));
+                if (hasPos) return true; // Mantém para corte fino interno
+                const hasNeg = negPoints.some(np => turf.booleanPointInPolygon(turf.point([np.lon, np.lat]), poly));
+                return !hasNeg;
+            });
+        }
+
         if (matchedPolygons.length === 0) {
-            dom.dockStatusHint.innerText = 'Nenhum piquete identificado nesta coordenada. Clique no interior de uma pastagem.';
+            if (state.candidateLayer) {
+                map.removeLayer(state.candidateLayer);
+                state.candidateLayer = null;
+            }
+            state.candidateMask = null;
+            dom.dockStatusHint.innerText = 'Área excluída pelos pontos negativos. Clique no interior de uma pastagem desejada.';
             dom.btnConfirmPaddock.disabled = true;
             dom.btnConfirmPaddock.classList.remove('ready');
+            dom.candidateScoreBadge.style.display = 'none';
+            dom.candidateAreaBadge.style.display = 'none';
             return;
         }
 
-        // 2. Une os polígonos dos pontos positivos se houver múltiplos
+        // 3. Une os polígonos dos pontos positivos se houver múltiplos
         let unionPoly = matchedPolygons[0];
         for (let i = 1; i < matchedPolygons.length; i++) {
-            try {
-                const merged = turf.union(unionPoly, matchedPolygons[i]);
-                if (merged) unionPoly = merged;
-            } catch (e) {
-                console.warn("Falha na união de polígonos:", e);
-            }
+            const merged = safeUnion(unionPoly, matchedPolygons[i]);
+            if (merged) unionPoly = merged;
         }
 
-        // 3. Aplica pontos negativos (−) como zonas de exclusão/recorte
+        // 4. Aplica pontos negativos (−) com recorte bissetriz e remoção de componentes desconectados
         if (negPoints.length > 0) {
             negPoints.forEach(np => {
                 try {
-                    // Buffer circular de 90m ao redor do ponto negativo
-                    const negCircle = turf.circle([np.lon, np.lat], 0.09, { units: 'kilometers', steps: 32 });
-                    const diff = turf.difference(unionPoly, negCircle);
-                    if (diff) {
-                        unionPoly = diff;
+                    const npTurf = turf.point([np.lon, np.lat]);
+                    
+                    // Encontra o ponto positivo mais próximo
+                    let closestPos = posPoints[0];
+                    let minPosDistKm = Infinity;
+                    posPoints.forEach(pp => {
+                        const d = turf.distance(npTurf, turf.point([pp.lon, pp.lat]), { units: 'kilometers' });
+                        if (d < minPosDistKm) {
+                            minPosDistKm = d;
+                            closestPos = pp;
+                        }
+                    });
+
+                    const polyBBox = turf.bbox(unionPoly);
+                    const isInside = turf.booleanPointInPolygon(npTurf, unionPoly);
+
+                    // 4a. Se o ponto negativo estiver no mesmo polígono ou próximo à borda,
+                    // divide pela bissetriz perpendicular entre o positivo e o negativo
+                    const bisectorExcl = createBisectorExclusion([closestPos.lon, closestPos.lat], [np.lon, np.lat], polyBBox);
+                    if (bisectorExcl) {
+                        const diffBisect = safeDifference(unionPoly, bisectorExcl);
+                        if (diffBisect) {
+                            unionPoly = diffBisect;
+                        }
+                    }
+
+                    // 4b. Buffer circular local de segurança para cavar feições isoladas (ex: represas, casas, fragmentos)
+                    const bufferRadiusKm = Math.max(0.04, Math.min(0.12, minPosDistKm * 0.40));
+                    const negCircle = turf.circle([np.lon, np.lat], bufferRadiusKm, { units: 'kilometers', steps: 32 });
+                    const diffCircle = safeDifference(unionPoly, negCircle);
+                    if (diffCircle) {
+                        unionPoly = diffCircle;
+                    }
+
+                    // 4c. Regra do SAM: descarta qualquer sub-polígono gerado pelo recorte que NÃO contenha ponto positivo
+                    let parts = [];
+                    if (unionPoly.geometry.type === 'MultiPolygon') {
+                        unionPoly.geometry.coordinates.forEach(coords => {
+                            parts.push(turf.polygon(coords));
+                        });
+                    } else if (unionPoly.geometry.type === 'Polygon') {
+                        parts = [unionPoly];
+                    }
+
+                    let retained = parts.filter(part => {
+                        return posPoints.some(pp => turf.booleanPointInPolygon(turf.point([pp.lon, pp.lat]), part));
+                    });
+
+                    // Fallback se todos ficaram na borda
+                    if (retained.length === 0 && parts.length > 0) {
+                        retained = [parts[0]];
+                    }
+
+                    if (retained.length === 1) {
+                        unionPoly = retained[0];
+                    } else if (retained.length > 1) {
+                        let combined = retained[0];
+                        for (let k = 1; k < retained.length; k++) {
+                            combined = safeUnion(combined, retained[k]) || combined;
+                        }
+                        unionPoly = combined;
                     }
                 } catch (e) {
                     console.warn("Falha no recorte negativo:", e);
@@ -520,11 +657,25 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        // 4. Calcula métricas finais
-        const area_m2 = turf.area(unionPoly);
-        const area_ha = Math.max(0.1, Number((area_m2 / 10000.0).toFixed(2)));
-        const baseScore = matchedPolygons[0].properties.confidence_score || 94.5;
-        const confidence_score = Number(Math.min(99.2, Math.max(88.0, baseScore + (posPoints.length * 0.8) - (negPoints.length * 0.5))).toFixed(1));
+        // 5. Calcula métricas finais
+        const area_m2 = unionPoly ? turf.area(unionPoly) : 0;
+        if (!unionPoly || area_m2 < 100) {
+            if (state.candidateLayer) {
+                map.removeLayer(state.candidateLayer);
+                state.candidateLayer = null;
+            }
+            state.candidateMask = null;
+            dom.dockStatusHint.innerText = 'Área completamente excluída pelos pontos negativos. Adicione novos pontos.';
+            dom.btnConfirmPaddock.disabled = true;
+            dom.btnConfirmPaddock.classList.remove('ready');
+            dom.candidateScoreBadge.style.display = 'none';
+            dom.candidateAreaBadge.style.display = 'none';
+            return;
+        }
+
+        const area_ha = Math.max(0.05, Number((area_m2 / 10000.0).toFixed(2)));
+        const baseScore = matchedPolygons[0]?.properties?.confidence_score || 94.5;
+        const confidence_score = Number(Math.min(99.2, Math.max(85.0, baseScore + (posPoints.length * 0.8) - (negPoints.length * 0.6))).toFixed(1));
 
         state.candidateMask = {
             area_ha,
@@ -532,7 +683,7 @@ document.addEventListener('DOMContentLoaded', () => {
             geojson: unionPoly.geometry
         };
 
-        // 5. Renderiza Contorno Neon Tracejado Ciano no Leaflet
+        // 6. Renderiza Contorno Neon Tracejado Ciano no Leaflet
         if (state.candidateLayer) {
             map.removeLayer(state.candidateLayer);
         }
